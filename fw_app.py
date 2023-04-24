@@ -44,44 +44,49 @@ BPF_MAP_RULES = "rules_map"
 
 @dataclass
 class Rule:
-    action: int
-    ip_src: str
-    ip_src_mask: int
-    ip_dst: str
-    ip_dst_mask: int
-    ip_proto: int
-    l4_sport: int
-    l4_dport: int
-    rate_limit: int
+    action: int  # 0 = DROP, 1 = ACCEPT, 2 = RATE_LIMIT
+    ip_src: str  # IP address in string format
+    ip_src_mask: int  # IP address mask length
+    ip_dst: str  # IP address in string format
+    ip_dst_mask: int  # IP address mask length
+    ip_proto: int  # IP protocol number, e.g., 6 for TCP, 17 for UDP, 1 for ICMP
+    l4_sport: int  # L4 source port
+    l4_dport: int  # L4 destination port
+    rate_limit: int  # Rate limit in packets per second (only used if action is RATE_LIMIT)
 
 
 class Firewall:
     def __init__(self, if_names: List[str]):
         self.if_names: List[str] = if_names
-        # Construct a byte string key for the BPF map. The key is a concatenation of the rule's fields.
-        # The struct format to match is:
-        # struct rule_key
-        # {
-        #     __u32 src_ip;  <-- in the Rule IP is a byte string already
-        #     __u32 dst_ip;  <-- in the Rule IP is a byte string already
-        #     __u8 protocol;
-        #     __u16 src_port;
-        #     __u16 dst_port;
-        # };
-        self.rule_key_format = (
-            "!4s4sBHH3x"  # ! denotes network byte order, 3x is padding to 16 bytes
-        )
+        # Construct a byte string key for the BPF map. The key is a __u32 that is the index of the rule in the BPF map.
+        self.rule_key_format = "I"  # I denotes a 32-bit unsigned integer
+
+        # Validate the size of the rule key struct
+        key_size = struct.calcsize(self.rule_key_format)
+        if key_size != 4:
+            logger.error(f"Invalid rule key size {key_size}. Expected 4 bytes.")
+            sys.exit(1)
 
         # Construct a byte string value for the BPF map. The value is a concatenation of the rule's action and action data.
         # The struct format to match is:
         # struct rule_data
         # {
-        #     __u8 action;
+        #     __u32 src_ip;   // Source IP address       <<-- already a byte string
+        #     __u32 dst_ip;   // Destination IP address  <<-- already a byte string
+        #     __u8 protocol;  // IP Protocol (e.g., TCP is 6, UDP is 17, ICMP is 1)
+        #     __u16 src_port; // Source port for TCP/UDP
+        #     __u16 dst_port; // Destination port for TCP/UDP
+        #     __u8 action;    // Action to take (ACCEPT, DROP, or RATE_LIMIT)
         #     __u32 action_data;
         # };
-        self.rule_data_format = (
-            "!BI3x"  # ! denotes network byte order, 3x is padding to 8 bytes
-        )
+        # Note: = denotes native byte order without alignment padding
+        self.rule_data_format = "=4s4sBHHBI"  # I is a 32-bit unsigned integer, B is a 8-bit unsigned integer, H is a 16-bit unsigned integer
+
+        # Validate the size of the rule data struct
+        value_size = struct.calcsize(self.rule_data_format)
+        if value_size != 18:
+            logger.error(f"Invalid rule data size {value_size}. Expected 18 bytes.")
+            sys.exit(1)
 
     def get_if_names(self):
         return self.if_names
@@ -91,11 +96,11 @@ class Firewall:
 
     def set_rules_from_json(self, rules_json: List[Dict]):
         rules = self.parse_rules(rules_json)
-        for rule in rules:
-            self.add_rule_to_map(rule)
+        for rule_idx, rule in enumerate(rules):
+            self.add_rule_to_map(rule_idx, rule)
 
     def get_rules_from_map(self):
-        rules = []
+        rules_dict = {}
         rules_from_map = self.dump_map(BPF_MAP_RULES)
 
         # rules_from_map has a list of dictionaries. Each dictionary has the following keys:
@@ -106,19 +111,23 @@ class Firewall:
             key_bytes = bytes(
                 bytearray(int(hex_byte_str, 16) for hex_byte_str in rule_dict["key"])
             )
+            logger.info(f"key_bytes: {key_bytes}")
             value_bytes = bytes(
                 bytearray(int(hex_byte_str, 16) for hex_byte_str in rule_dict["value"])
             )
+            logger.info(f"value_bytes: {value_bytes}")
 
             # Unpack the key and value byte strings into the rule fields
+            (rule_idx,) = struct.unpack(self.rule_key_format, key_bytes)
             (
                 ip_src,
                 ip_dst,
                 ip_proto,
                 l4_sport,
                 l4_dport,
-            ) = struct.unpack(self.rule_key_format, key_bytes)
-            (action, rate_limit) = struct.unpack(self.rule_data_format, value_bytes)
+                action,
+                rate_limit,
+            ) = struct.unpack(self.rule_data_format, value_bytes)
 
             # Convert the IP addresses from byte strings to IP addresses
             ip_src = str(ipaddress.IPv4Address(ip_src))
@@ -137,30 +146,32 @@ class Firewall:
                 rate_limit,
             )
 
-            rules.append(rule)
-        return rules
+            rules_dict[rule_idx] = rule
 
-    def add_rule_to_map(self, rule: Rule):
+        # Sort the rules by index and return them as a list
+        return [rules_dict[rule_idx] for rule_idx in sorted(rules_dict.keys())]
+
+    def add_rule_to_map(self, rule_idx, rule: Rule):
         # Add the rule to the BPF map
         logger.info("Adding rule to BPF map")
         logger.debug(str(rule))
 
-        # Pack the fields into a byte string
-        rule_key_bytes = struct.pack(
-            self.rule_key_format,
-            ipaddress.IPv4Address(rule.ip_src).packed,  # convert to bytes
-            ipaddress.IPv4Address(rule.ip_dst).packed,  # convert to bytes
-            rule.ip_proto,
-            rule.l4_sport,
-            rule.l4_dport,
-        )
+        # Construct a byte string key for the BPF map. The key is a __u32 that is the index of the rule in the BPF map.
+        rule_key_bytes = struct.pack(self.rule_key_format, rule_idx)
+        logger.debug("rule_key_bytes: " + str(rule_key_bytes))
 
         # Pack the fields into a byte string
         rule_data_bytes = struct.pack(
             self.rule_data_format,
-            rule.action,
-            rule.rate_limit,
+            ipaddress.IPv4Address(rule.ip_src).packed,  # convert to bytes, 4 bytes
+            ipaddress.IPv4Address(rule.ip_dst).packed,  # convert to bytes, 4 bytes
+            rule.ip_proto,  # 1 byte
+            rule.l4_sport,  # 2 bytes
+            rule.l4_dport,  # 2 bytes
+            rule.action,  # 1 byte
+            rule.rate_limit,  # 4 bytes
         )
+        logger.debug("rule_data_bytes: " + str(rule_data_bytes))
 
         # Add the rule to the BPF map
         for if_name in self.if_names:
